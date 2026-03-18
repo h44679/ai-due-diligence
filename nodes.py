@@ -2,7 +2,6 @@ import streamlit as st
 from openai import OpenAI
 import re
 import time
-import concurrent.futures
 from typing import List, Dict, Any
 
 try:
@@ -24,7 +23,8 @@ def select_best_data(scraped_data: List[Dict], max_items: int = 5) -> List[Dict]
     
     不同爬虫工具可靠性差异大：Trafilatura提取正文最干净，
     BS4可能带导航栏杂质，Snippet可能只有摘要。
-    按来源质量加权，同类最多取2条避免单一来源垄断。
+    按来源质量加权，同类最多取3条避免单一来源垄断，
+    同时放宽到3条确保能凑够5条（避免Reviewer死循环）。
     """
     if not scraped_data:
         return []
@@ -59,7 +59,7 @@ def select_best_data(scraped_data: List[Dict], max_items: int = 5) -> List[Dict]
         else:
             cat = "snippet"
             
-        if type_count[cat] < 2 and len(selected) < max_items:
+        if type_count[cat] < 3 and len(selected) < max_items:
             selected.append(item)
             type_count[cat] += 1
     
@@ -68,25 +68,22 @@ def select_best_data(scraped_data: List[Dict], max_items: int = 5) -> List[Dict]
     return selected
 
 def planner_node(state: Dict):
-    """生成4个搜索关键词，超限时截断以控制成本。"""
+    """规划节点 - 限制4个关键词"""
     status = get_ui_container('status')
     progress = get_ui_container('progress')
     
     if status:
         status.markdown("""
             <div class="status-card">
-                <div style="color:#38bdf8;font-weight:600;">🧠 Planner: 正在规划...</div>
+                <div style="color:#38bdf8;font-weight:600;font-size:1.2rem;">🧠 PLANNER 节点</div>
+                <div style="color:#e2e8f0;margin-top:0.5rem;">正在生成搜索策略...</div>
             </div>
         """, unsafe_allow_html=True)
     if progress:
         progress.progress(0.15)
     
     try:
-        client = OpenAI(
-            api_key=state['api_key'], 
-            base_url="https://api.siliconflow.cn/v1", 
-            timeout=10.0
-        )
+        client = OpenAI(api_key=state['api_key'], base_url="https://api.siliconflow.cn/v1", timeout=10.0)
         plans = get_search_plan(state['company'], client=client)
         search_plans = plans.get("search_plans", [])
         
@@ -94,12 +91,8 @@ def planner_node(state: Dict):
             search_plans = search_plans[:4]
         
         if not search_plans:
-            search_plans = [
-                f"{state['company']} CEO founder",
-                f"{state['company']} funding history", 
-                f"{state['company']} business model",
-                f"{state['company']} competitors"
-            ]
+            search_plans = [f"{state['company']} CEO", f"{state['company']} funding", 
+                          f"{state['company']} business", f"{state['company']} market"]
         
         return {
             "search_plans": search_plans,
@@ -108,205 +101,149 @@ def planner_node(state: Dict):
         }
     except Exception as e:
         return {
-            "search_plans": [
-                f"{state['company']} CEO", 
-                f"{state['company']} funding", 
-                f"{state['company']} business", 
-                f"{state['company']} market"
-            ],
+            "search_plans": [f"{state['company']} CEO", f"{state['company']} funding", 
+                          f"{state['company']} business", f"{state['company']} market"],
             "current_step": f"规划失败，使用默认策略",
             "error": None
         }
 
-def researcher_node(state: Dict):
-    """并发搜索，控制速率避免触发Tavily限流。"""
+def search_single_node(state: Dict, idx: int):
+    """
+    搜索第idx个关键词。
+    
+    拆成4个独立节点是为了让LangGraph每搜完一个就yield一次，
+    避免15秒阻塞导致前端卡在Planner界面不动。
+    """
     if state.get('error'):
-        return {"scraped_data": [], "current_step": "跳过 Researcher"}
+        return {"scraped_data": state.get('scraped_data', []), "current_step": f"跳过搜索{idx+1}"}
     
     status = get_ui_container('status')
-    progress = get_ui_container('progress')
     details = get_ui_container('details')
     
     keywords = state.get('search_plans', [])
-    if not keywords:
-        return {"scraped_data": [], "current_step": "无关键词"}
     
-    if len(keywords) > 4:
-        keywords = keywords[:4]
-        print(f"  限制关键词数量: 4个")
+    if idx >= len(keywords):
+        return {
+            "current_step": f"搜索({idx+1}/4): 无关键词",
+            "total_data_found": len(state.get('scraped_data', []))
+        }
     
-    print(f"  搜索 {len(keywords)} 个关键词")
-    
-    # 修复核心Bug：累加之前的数据，不要覆盖
+    kw = keywords[idx]
+    # 累加之前的数据，重试时必须保留旧数据才能凑够5条
     existing_data = state.get('scraped_data', [])
-    all_data = existing_data.copy()  # 先复制已有数据（重试时不丢失）
+    all_data = existing_data.copy()
     
-    completed = 0
+    # 立即显示当前正在搜索哪个（完整关键词，用户体验要求无截断）
+    if status:
+        status.markdown(f"""
+            <div class="status-card">
+                <div style="color:#38bdf8;font-weight:600;font-size:1.2rem;">🔍 RESEARCHER 节点 ({idx+1}/4)</div>
+                <div style="color:#fbbf24;font-size:1.1rem;margin-top:8px;font-family:monospace;">
+                    ▶ {kw}
+                </div>
+                <div style="color:#94a3b8;font-size:0.85rem;margin-top:5px;">
+                    历史数据: {len(existing_data)} 条 | 搜索中...
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
     
-    def search_single(kw):
-        try:
-            data = search_and_extract([kw], max_results_per_kw=2, api_key=state.get('tavily_key'))
-            time.sleep(0.5)
-            return {"kw": kw, "data": data, "error": None}
-        except Exception as e:
-            return {"kw": kw, "data": [], "error": str(e)}
+    print(f"  [{idx+1}/4] 搜索: {kw}")
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {executor.submit(search_single, kw): kw for kw in keywords}
+    try:
+        data = search_and_extract([kw], max_results_per_kw=2, api_key=state.get('tavily_key'))
+        all_data.extend(data)
         
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            completed += 1
-            
-            if progress:
-                progress.progress(0.15 + completed / len(keywords) * 0.45)
-            
-            if result["error"]:
-                print(f"    ✗ {result['kw'][:20]}: 失败")
-            else:
-                all_data.extend(result["data"])  # 追加新数据到旧数据
-                print(f"    ✓ {result['kw'][:20]}: {len(result['data'])}条")
-                
-                if details and result["data"]:
-                    with details:
-                        st.markdown(f"<div class='agent-log'>✓ {result['kw'][:30]}: {len(result['data'])}条</div>", 
-                                  unsafe_allow_html=True)
-            
-            if status:
-                status.markdown(f"""
-                    <div class="status-card">
-                        <div style="color:#38bdf8;font-weight:600;">🔍 Researcher: {completed}/{len(keywords)}完成</div>
-                        <div style="color:#94a3b8;font-size:0.85rem;">累计收集 {len(all_data)} 条数据</div>
-                    </div>
-                """, unsafe_allow_html=True)
-    
-    # 从累加后的总数据里精选最好的5条（去重+质量排序）
-    selected_data = select_best_data(all_data, max_items=5)
-    
-    if progress:
-        progress.progress(0.6)
-    
-    return {
-        "scraped_data": selected_data,  # 返回累加后精选的数据
-        "current_step": f"🔍 Researcher: 累计 {len(all_data)} 条，精选 {len(selected_data)} 条",
-        "total_data_found": len(selected_data),
-        "error": None
-    }
+        if details:
+            with details:
+                st.markdown(f"<div class='agent-log'>✓ [{idx+1}/4] {kw}: {len(data)}条</div>", unsafe_allow_html=True)
+        
+        # Tavily免费版有RPM限制，0.5秒缓冲避免触发429限流
+        time.sleep(0.5)
+        
+        return {
+            "scraped_data": all_data,
+            "current_step": f"搜索({idx+1}/4): {kw}... 找到{len(data)}条",
+            "total_data_found": len(all_data)
+        }
+        
+    except Exception as e:
+        print(f"    ✗ {kw}: 失败")
+        if details:
+            with details:
+                st.markdown(f"<div class='agent-log'>✗ [{idx+1}/4] {kw}: 失败</div>", unsafe_allow_html=True)
+        
+        return {
+            "scraped_data": all_data,
+            "current_step": f"搜索({idx+1}/4): {kw}... 失败",
+            "total_data_found": len(all_data),
+            "error": None
+        }
 
 def reviewer_node(state: Dict):
-    """
-    审核数据质量，决定进入Writer或重试。
-    
-    重试策略优先级：
-    1. 完全无数据且已重试过 -> 终止（避免无限循环）
-    2. 数据不足(<5条)且未超2次重试 -> 补充专业数据源（如SEC filing）
-    3. 数据充足或已尽力 -> 通过
-    """
-    print("👀 Reviewer 节点开始...")
-    
-    if state.get('error'):
-        return {"is_sufficient": True, "current_step": "跳过审核", "total_data_found": 0}
-    
+    """审核节点"""
     status = get_ui_container('status')
     progress = get_ui_container('progress')
     
     if progress:
-        progress.progress(0.7)
+        progress.progress(0.75)
     
     data = state.get('scraped_data', [])
     loop = state.get('loop_count', 0)
     
     print(f"  检查: {len(data)}条数据, 第{loop}次循环")
     
-    # 完全无数据
     if len(data) == 0:
         if loop >= 1:
             if status:
-                status.markdown("""
-                    <div class="status-card" style="border-color:#f87171;">
-                        <div style="color:#f87171;font-weight:600;">👀 Reviewer: ❌ 无可用数据</div>
-                    </div>
-                """, unsafe_allow_html=True)
-            return {
-                "is_sufficient": False,
-                "loop_count": loop,
-                "current_step": "👀 Reviewer: 无数据，强制结束",
-                "total_data_found": 0,
-                "error": "未找到数据"
-            }
+                status.markdown("""<div class="status-card" style="border-color:#f87171;">
+                    <div style="color:#f87171;font-weight:600;">👀 Reviewer: ❌ 无可用数据</div>
+                </div>""", unsafe_allow_html=True)
+            return {"is_sufficient": False, "loop_count": loop, "current_step": "无数据，强制结束", 
+                   "total_data_found": 0, "error": "未找到数据"}
         else:
-            if status:
-                status.markdown("""
-                    <div class="status-card" style="border-color:#fbbf24;">
-                        <div style="color:#fbbf24;font-weight:600;">👀 Reviewer: 未找到数据，补充搜索...</div>
-                    </div>
-                """, unsafe_allow_html=True)
-            return {
-                "is_sufficient": False,
-                "loop_count": loop + 1,
-                "current_step": "👀 Reviewer: 补充搜索",
-                "total_data_found": 0,
-                "search_plans": [f"{state['company']} detailed information", 
-                               f"{state['company']} company profile"]
-            }
+            return {"is_sufficient": False, "loop_count": loop + 1, "current_step": "补充搜索",
+                   "total_data_found": 0, "search_plans": [f"{state['company']} detailed info"]}
     
-    # 数据不足(<5条)且还能重试
     if len(data) < 5 and loop < 2:
-        print(f"  触发重试: {len(data)}条 < 5条, 第{loop}次循环")
         if status:
-            status.markdown(f"""
-                <div class="status-card" style="border-color:#fbbf24;">
-                    <div style="color:#fbbf24;font-weight:600;">👀 Reviewer: 数据不足({len(data)}条<5条)，第{loop+1}次重试</div>
-                </div>
-            """, unsafe_allow_html=True)
+            status.markdown(f"""<div class="status-card" style="border-color:#fbbf24;">
+                <div style="color:#fbbf24;font-weight:600;">👀 Reviewer: 数据不足({len(data)}条<5条)，第{loop+1}次重试</div>
+            </div>""", unsafe_allow_html=True)
         return {
             "is_sufficient": False,
             "loop_count": loop + 1,
-            "current_step": f"👀 Reviewer: 数据不足({len(data)}条)，第{loop+1}次重试",
+            "current_step": f"数据不足({len(data)}条)，第{loop+1}次重试",
             "total_data_found": len(data),
-            "search_plans": [f"{state['company']} financial report detailed", 
-                           f"{state['company']} annual report SEC filing"]
+            "search_plans": [f"{state['company']} financial report", f"{state['company']} SEC filing"]
         }
     
-    # 数据充足或已重试2次，进入Writer
     if status:
-        status.markdown("""
-            <div class="status-card" style="border-color:#4ade80;">
-                <div style="color:#4ade80;font-weight:600;">👀 Reviewer: ✅ 审核通过</div>
-                <div style="color:#38bdf8;font-size:0.9rem;margin-top:5px;">✍️ Writer 节点开始...</div>
-            </div>
-        """, unsafe_allow_html=True)
+        status.markdown("""<div class="status-card" style="border-color:#4ade80;">
+            <div style="color:#4ade80;font-weight:600;">👀 Reviewer: ✅ 审核通过</div>
+        </div>""", unsafe_allow_html=True)
     
     return {
         "is_sufficient": True,
         "loop_count": loop,
-        "current_step": "👀 Reviewer: 审核通过 → ✍️ Writer 开始生成",
+        "current_step": "审核通过 → Writer开始生成",
         "total_data_found": len(data)
     }
 
 def writer_node(state: Dict):
-    """生成尽调报告，使用非流式避免Streamlit长连接超时。"""
-    print("✍️ Writer 节点开始...")
-    
+    """写作节点"""
     status = get_ui_container('status')
     progress = get_ui_container('progress')
     report_container = get_ui_container('report')
     
     if progress:
-        progress.progress(0.85)
+        progress.progress(0.9)
     
     if state.get('error'):
-        error_report = f"## 生成失败\n\n**错误**: {state['error']}"
-        if report_container:
-            report_container.markdown(f"<div class='report-card'>{error_report}</div>", unsafe_allow_html=True)
-        return {"report": error_report, "current_step": "生成错误报告"}
+        return {"report": f"## 错误\n{state['error']}", "current_step": "生成错误报告"}
     
     data = state.get('scraped_data', [])
     if not data:
-        no_data_report = "## 数据不足\n\n未能找到有效信息。"
-        if report_container:
-            report_container.markdown(f"<div class='report-card'>{no_data_report}</div>", unsafe_allow_html=True)
-        return {"report": no_data_report, "current_step": "Writer: 无数据"}
+        return {"report": "## 数据不足", "current_step": "Writer: 无数据"}
     
     data_summary = []
     for item in data[:3]:
@@ -317,22 +254,15 @@ def writer_node(state: Dict):
     prompt = f"""基于以下数据生成"{state['company']}"尽调报告：
 {chr(10).join(data_summary)}
 
-要求：1.Markdown格式 2.包含概况/团队/融资/商业模式/风险 3.简洁500字以内"""
+要求：1.Markdown格式 2.包含概况/团队/融资/商业模式/风险 3.简洁500字"""
 
     try:
-        client = OpenAI(
-            api_key=state['api_key'], 
-            base_url="https://api.siliconflow.cn/v1",
-            timeout=180.0
-        )
+        client = OpenAI(api_key=state['api_key'], base_url="https://api.siliconflow.cn/v1", timeout=180.0)
         
         if status:
-            status.markdown("""
-                <div class="status-card">
-                    <div style="color:#38bdf8;font-weight:600;">✍️ Writer: 正在生成报告...</div>
-                    <div class="time-estimate">约需10-20秒</div>
-                </div>
-            """, unsafe_allow_html=True)
+            status.markdown("""<div class="status-card">
+                <div style="color:#38bdf8;font-weight:600;">✍️ Writer: 正在生成报告...</div>
+            </div>""", unsafe_allow_html=True)
         
         response = client.chat.completions.create(
             model="Pro/deepseek-ai/DeepSeek-V3",
@@ -343,7 +273,7 @@ def writer_node(state: Dict):
         )
         
         full_report = response.choices[0].message.content
-        
+        # 清理可能的代码块标记，保证纯Markdown输出
         full_report = re.sub(r'^```markdown\s*', '', full_report)
         full_report = re.sub(r'^```\s*', '', full_report)
         full_report = re.sub(r'\s*```$', '', full_report)
@@ -351,20 +281,7 @@ def writer_node(state: Dict):
         if report_container:
             report_container.markdown(f"<div class='report-card'>{full_report}</div>", unsafe_allow_html=True)
         
-        if status:
-            status.markdown("""
-                <div class="status-card" style="border-color:#4ade80;">
-                    <div style="color:#4ade80;font-weight:600;">✍️ Writer: 报告生成完成</div>
-                </div>
-            """, unsafe_allow_html=True)
-        if progress:
-            progress.progress(1.0)
-        
         return {"report": full_report, "current_step": "✍️ Writer: 完成"}
         
     except Exception as e:
-        error_msg = f"生成失败: {str(e)}"
-        print(f"  ❌ {error_msg}")
-        if report_container:
-            report_container.markdown(f"<div class='report-card'>{error_msg}</div>", unsafe_allow_html=True)
-        return {"report": error_msg, "current_step": f"Writer错误: {e}"}
+        return {"report": f"生成失败: {e}", "current_step": f"Writer错误"}

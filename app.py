@@ -51,11 +51,6 @@ st.markdown("""
     border-radius: 6px;
     margin: 4px 0;
     border-left: 3px solid #38bdf8;
-    animation: fadeIn 0.3s ease-in;
-}
-@keyframes fadeIn {
-    from { opacity: 0; transform: translateX(-10px); }
-    to { opacity: 1; transform: translateX(0); }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -67,49 +62,33 @@ if "logs" not in st.session_state:
     st.session_state.logs = []
 if "is_running" not in st.session_state:
     st.session_state.is_running = False
+# LangGraph conditional edge会导致同一节点重复触发，用于去重跟踪
+if "last_node" not in st.session_state:
+    st.session_state.last_node = None
 
 with st.sidebar:
     st.header("⚙️ 配置中心")
     
-    # Streamlit Secrets访问在Cloud和本地表现不同，需要兼容处理
     try:
         api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
         tavily_key = st.secrets.get("TAVILY_API_KEY", "")
-        secrets_available = True
     except Exception:
-        secrets_available = False
         api_key = ""
         tavily_key = ""
     
-    # 只有secrets不可用时才显示输入框，兼顾安全性与本地调试便利性
     if not api_key:
-        api_key = st.text_input(
-            "DeepSeek API Key", 
-            type="password", 
-            value=st.session_state.get("api_key_input", ""),
-            key="api_key_input"
-        )
+        api_key = st.text_input("DeepSeek API Key", type="password", key="api_key_input")
     else:
-        st.success("✓ DeepSeek Key 已配置 (Secrets)")
+        st.success("✓ DeepSeek Key 已配置")
     
     if not tavily_key:
-        tavily_key = st.text_input(
-            "Tavily API Key", 
-            type="password",
-            value=st.session_state.get("tavily_key_input", ""),
-            key="tavily_key_input"
-        )
+        tavily_key = st.text_input("Tavily API Key", type="password", key="tavily_key_input")
     else:
-        st.success("✓ Tavily Key 已配置 (Secrets)")
-    
-    st.markdown("---")
-    company_name = st.text_input(
-        "🏢 目标公司", 
-        value="Tesla",
-        disabled=st.session_state.is_running
-    )
+        st.success("✓ Tavily Key 已配置")
     
     # 运行时禁用按钮防止重复提交（防抖动）
+    company_name = st.text_input("🏢 目标公司", value="Tesla", disabled=st.session_state.is_running)
+    
     start_button = st.button(
         "🚀 开始尽调分析", 
         type="primary", 
@@ -119,29 +98,36 @@ with st.sidebar:
 
 st.markdown("""
 <div style="text-align: center; margin-bottom: 2rem;">
-    <h1 style="color: #e0f2fe; margin-bottom: 0.5rem;">🏔️ AI 公司尽调系统</h1>
-    <p style="color: #94a3b8; font-size: 0.9rem;">LangGraph 驱动 • 多 Agent 协作 • 高质量数据筛选</p>
+    <h1 style="color: #e0f2fe;">🏔️ AI 公司尽调系统</h1>
+    <p style="color: #94a3b8;">LangGraph 驱动 • 多 Agent 协作</p>
 </div>
 """, unsafe_allow_html=True)
 
 def reset_session():
-    """清空状态开始新的工作流"""
     st.session_state.report = None
     st.session_state.logs = []
     st.session_state.is_running = False
+    st.session_state.last_node = None
 
 def run_workflow():
-    """封装工作流逻辑，与UI渲染解耦，支持异常时的状态清理"""
     st.session_state.is_running = True
     st.session_state.report = None
     st.session_state.logs = []
+    st.session_state.last_node = None
     
     progress_bar = st.progress(0)
     status_card = st.empty()
     log_container = st.empty()
     report_container = st.empty()
     
-    # LangGraph的stream期望接收dict格式的state，不是Pydantic模型实例
+    # 存储UI容器引用到session_state，供nodes.py使用（避免global变量污染）
+    st.session_state.ui_containers = {
+        'status': status_card,
+        'progress': progress_bar,
+        'details': log_container,
+        'report': report_container
+    }
+    
     initial_input = {
         "company": company_name,
         "api_key": api_key,
@@ -159,33 +145,34 @@ def run_workflow():
     }
     
     try:
-        node_progress = {
-            "planner": 0.2,
-            "researcher": 0.5,
-            "reviewer": 0.7,
-            "writer": 0.9
-        }
-        
-        logs_display = log_container.container()
-        
         for event in workflow_app.stream(initial_input):
             for node_name, state_update in event.items():
                 step_msg = state_update.get("current_step", f"节点: {node_name}")
                 
-                # 限制内存中的日志数量，防止长流程导致浏览器内存泄漏
-                st.session_state.logs.append(f"[{node_name}] {step_msg}")
-                if len(st.session_state.logs) > 50:
+                # LangGraph conditional edge会导致同一节点重复触发，只更新不追加避免刷屏
+                if st.session_state.last_node == node_name:
+                    if st.session_state.logs:
+                        st.session_state.logs[-1] = f"[{node_name}] {step_msg}"
+                else:
+                    st.session_state.logs.append(f"[{node_name}] {step_msg}")
+                    st.session_state.last_node = node_name
+                
+                # 限制日志数量防止浏览器内存泄漏（长流程时尤其重要）
+                if len(st.session_state.logs) > 20:
                     st.session_state.logs.pop(0)
                 
-                # 仅显示最近5条日志，平衡信息密度与可读性
-                with logs_display:
-                    for log in st.session_state.logs[-5:]:
-                        st.markdown(f"<div class='agent-log'>{log}</div>", 
-                                  unsafe_allow_html=True)
+                with log_container.container():
+                    for log in st.session_state.logs[-6:]:
+                        st.markdown(f"<div class='agent-log'>{log}</div>", unsafe_allow_html=True)
                 
-                # 节点级进度条更新，给用户清晰的阶段感知
-                if node_name in node_progress:
-                    progress_bar.progress(node_progress[node_name])
+                progress_map = {
+                    "planner": 0.15,
+                    "search_1": 0.25, "search_2": 0.35, "search_3": 0.45, "search_4": 0.55,
+                    "reviewer": 0.75,
+                    "writer": 0.9
+                }
+                if node_name in progress_map:
+                    progress_bar.progress(progress_map[node_name])
                 
                 status_card.markdown(f"""
                 <div class="status-card">
@@ -202,13 +189,9 @@ def run_workflow():
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # 检查report字段是否存在且非空（可能是空字符串或太短）
                 report_content = state_update.get("report")
                 if report_content and isinstance(report_content, str) and len(report_content) > 100:
-                    report_container.markdown(
-                        f"<div class='report-card'>{report_content}</div>", 
-                        unsafe_allow_html=True
-                    )
+                    report_container.markdown(f"<div class='report-card'>{report_content}</div>", unsafe_allow_html=True)
                     st.session_state.report = report_content
         
         progress_bar.progress(1.0)
@@ -230,7 +213,6 @@ if start_button:
     else:
         run_workflow()
 
-# 报告生成后展示下载按钮，放在if start_button块外确保rerun后依然可见
 if st.session_state.report:
     st.success("✅ 分析完成！")
     st.download_button(
