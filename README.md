@@ -16,7 +16,7 @@
 - **部署**: Streamlit Community Cloud
 
 ## 演示
-[部署后的公网链接会在这里]
+🔗 **在线体验**: https://ai-due-diligence-8bybyhfcubb9easfrjyjut.streamlit.app/
 
 ## 本地运行
 ```bash
